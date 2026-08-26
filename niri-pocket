@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+
+import argparse
+import asyncio
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+from collections import deque
+from typing import Any
+
+SOCKET_PATH = "/tmp/niri_pocket.sock"
+pocket_queue = deque()  # FIFO queue to store window IDs sent to pocket
+
+controlled_windows = {}  # Dictionary to store controlled windows with their IDs
+
+# Load JSON data safely, returning a default value if parsing fails.
+def safe_json_loads(data: Any, default=None) -> Any:
+    try:
+        return json.loads(data)
+    except (json.JSONDecodeError, TypeError):
+        return default
+
+# Run a command and return its output as JSON.
+def run_command_json(command):
+    """Run a command and return its output as JSON."""
+    result = subprocess.run(command, capture_output=True, check=True)
+    return json.loads(result.stdout)
+
+# Run a command and return True if successful, False otherwise.
+def run_command(command):
+    proc = subprocess.run(command, check=False, capture_output=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr.decode())
+        return False
+    return True
+
+# Send desktop notifications using notify-send for info message.
+def notify_info(title: str, message: str):
+    """Send a notification using notify-send."""
+    run_command(["notify-send", "--icon", "info", "--app-name", "niri-pocket", title, message])
+
+
+# Send desktop notifications using notify-send for error message.
+def notify_error(title: str, message: str):
+    """Send an error notification using notify-send."""
+    run_command(["notify-send", "--icon", "error", "--app-name", "niri-pocket", "-u", "critical", title, message])
+
+
+# Define the monitor and window classes to encapsulate their properties and actions.
+class monitor:
+    """Class representing a monitor."""
+
+    def __init__(self):
+        self.data = None
+
+    def get_name(self):
+        """Get the name of the monitor."""
+        return self.data.get("name") if self.data else None
+
+    def get_logical_width(self):
+        """Get the logical width of the monitor."""
+        return self.data.get("logical", {}).get("width") if self.data else None
+
+    def get_logical_height(self):
+        """Get the logical height of the monitor."""
+        return self.data.get("logical", {}).get("height") if self.data else None
+
+    def make_focused(self):
+        """Make this monitor the focused monitor."""
+        if self.data:
+            command = ["niri", "msg", "action", "focus-monitor", self.get_name()]
+            return run_command(command)
+        return False
+
+    @staticmethod
+    def from_id(name):
+        """Create a monitor object from a monitor ID."""
+        command = ["niri", "msg", "--json", "outputs"]
+        data = run_command_json(command)
+        for monitor_name, monitor_data in data.items():
+            if monitor_name == name:
+                monitor_obj = monitor()
+                monitor_obj.data = monitor_data
+                return monitor_obj
+        return None
+
+    @staticmethod
+    def get_active_monitor():
+        """Get the active monitor using niri."""
+        command = ["niri", "msg", "--json", "focused-output"]
+        monitor_data = run_command_json(command)
+        if monitor_data:
+            monitor_obj = monitor()
+            monitor_obj.data = monitor_data
+            return monitor_obj
+        return None
+
+
+# Define the window class to encapsulate its properties and actions.
+class window:
+    """Class representing a window."""
+
+    def __init__(self):
+        self.data = None
+
+    def get_id(self):
+        """Get the ID of the window."""
+        return self.data.get("id") if self.data else None
+
+    def get_app_id(self):
+        """Get the app ID of the window."""
+        return self.data.get("app_id") if self.data else None
+
+    def is_focused(self):
+        """Check if the window is focused."""
+        return self.data.get("is_focused") if self.data else False
+
+    def get_workspace(self):
+        """Get the workspace of the window."""
+        return self.data.get("workspace_id") if self.data else None
+
+    def is_floating(self):
+        """Check if the window is floating."""
+        return self.data.get("is_floating") if self.data else False
+
+    def send_to_pocket(self, monitor_name: str):
+        """Send the window to the pocket output."""
+        if self.data:
+            focused_monitor = monitor.get_active_monitor()
+            if not focused_monitor:
+                print("No active monitor found. Cannot send window to pocket.")
+                return False
+            command = ["niri", "msg", "action", "move-window-to-monitor", "--id", str(self.get_id()), monitor_name]
+            if run_command(command):
+                focused_monitor.make_focused()
+                print(f"Window {self.get_app_id()} sent to pocket output {monitor_name}.")
+                return True
+        return False
+
+    def get_from_pocket(self):
+        """Get the window from the pocket output."""
+        if self.data:
+            focused_monitor = monitor.get_active_monitor()
+            if not focused_monitor:
+                print("No active monitor found. Cannot get window from pocket.")
+                return False
+            command = ["niri", "msg", "action", "move-window-to-monitor", "--id", str(self.get_id()), focused_monitor.get_name()]
+            if run_command(command):
+                print(f"Window {self.get_app_id()} got from pocket.")
+                return True
+        return False
+
+    def make_focused(self):
+        """Make this window the focused window."""
+        if self.data:
+            command = ["niri", "msg", "action", "focus-window", "--id", str(self.get_id())]
+            return run_command(command)
+        return False
+
+    def get_monitor(self):
+        """Get the name of the monitor this window is on."""
+        if not self.data:
+            return None
+        command = ["niri", "msg", "--json", "workspaces"]
+        ws_data = run_command_json(command)
+        if not ws_data:
+            return None
+
+        for ws in ws_data:
+            if ws["id"] == self.data["workspace_id"]:
+                return monitor.from_id(ws.get("output"))
+        
+        return None
+
+    def make_sidebar(self, align: str, offset_x: int, offset_top: int, offset_bottom: int, width: float):
+        """Make this window the sidebar window."""
+        if not self.data:
+            return False
+
+        if align not in ["left", "right"]:
+            print("Invalid alignment. Must be 'left' or 'right'.")
+            return False
+
+        window_monitor = self.get_monitor()
+        if not window_monitor:
+            print("No active monitor found. Cannot make window sidebar.")
+            return False
+
+        window_width = int(window_monitor.get_logical_width() * width)
+        if align == "left":
+            window_x = offset_x
+        else:  # align == "right"
+            window_x = window_monitor.get_logical_width() - offset_x - window_width
+        window_y = offset_top
+        window_height = window_monitor.get_logical_height() - offset_top - offset_bottom
+
+        if not self.is_floating():
+            command = ["niri", "msg", "action", "move-window-to-floating", "--id", str(self.get_id())]
+            if not run_command(command):
+                print(f"Failed to move window {self.get_app_id()} to floating.")
+                return False
+        command = ["niri", "msg", "action", "move-floating-window", "--id", str(self.get_id()), "--x", str(window_x), "--y", str(window_y)]
+        if not run_command(command):
+            print(f"Failed to move window {self.get_app_id()} to floating.")
+            return False
+        command = ["niri", "msg", "action", "set-window-width", "--id", str(self.get_id()), str(window_width)]
+        if not run_command(command):
+            print(f"Failed to set width for window {self.get_app_id()}.")
+            return False
+        command = ["niri", "msg", "action", "set-window-height", "--id", str(self.get_id()), str(window_height)]
+        if not run_command(command):
+            print(f"Failed to set height for window {self.get_app_id()}.")
+            return False
+        return True
+
+    def make_center(self, width: float, height: float):
+        """Make this window centered with specified width and height."""
+        if not self.data:
+            return False
+
+        window_monitor = self.get_monitor()
+        if not window_monitor:
+            print("No active monitor found. Cannot center window.")
+            return False
+
+        window_width = int(window_monitor.get_logical_width() * width)
+        window_height = int(window_monitor.get_logical_height() * height)
+
+        window_x = int((window_monitor.get_logical_width() - window_width) // 2)
+        window_y = int((window_monitor.get_logical_height() - window_height) // 2)
+
+        if not self.is_floating():
+            command = ["niri", "msg", "action", "move-window-to-floating", "--id", str(self.get_id())]
+            if not run_command(command):
+                print(f"Failed to move window {self.get_app_id()} to floating.")
+                return False
+        command = ["niri", "msg", "action", "move-floating-window", "--id", str(self.get_id()), "--x", str(window_x), "--y", str(window_y)]
+        if not run_command(command):
+            print(f"Failed to move window {self.get_app_id()} to floating.")
+            return False
+        command = ["niri", "msg", "action", "set-window-width", "--id", str(self.get_id()), str(window_width)]
+        if not run_command(command):
+            print(f"Failed to set width for window {self.get_app_id()}.")
+            return False
+        command = ["niri", "msg", "action", "set-window-height", "--id", str(self.get_id()), str(window_height)]
+        if not run_command(command):
+            print(f"Failed to set height for window {self.get_app_id()}.")
+            return False
+        return True
+
+    @staticmethod
+    def get_window(window_id):
+        """Get window information using niri."""
+        command = ["niri", "msg", "--json", "windows"]
+        window_data = run_command_json(command)
+        for win_data in window_data:
+            if win_data.get("id") == window_id:
+                window_obj = window()
+                window_obj.data = win_data
+                return window_obj
+        return None
+
+    @staticmethod
+    def get_focused_window():
+        """Get the currently focused window using niri."""
+        command = ["niri", "msg", "--json", "focused-window"]
+        window_data = run_command_json(command)
+        if window_data:
+            window_obj = window()
+            window_obj.data = window_data
+            return window_obj
+        return None
+
+# Add a window to the controlled windows dictionary.
+def control_window(wnd: window, data: dict):
+    """Add a window to the controlled windows dictionary."""
+    window_id = wnd.get_id()
+    if window_id not in controlled_windows:
+        controlled_windows[window_id] = {
+            "window": wnd,
+            "data": data
+        }
+        print(f"[Control] Window {window_id} added to controlled windows.")
+    else:
+        controlled_windows[window_id]["window"] = wnd
+        controlled_windows[window_id]["data"] = data
+
+# Update the data of a controlled window.
+def update_controlled_window(wnd: window):
+    """Update the data of a controlled window."""
+    window_id = wnd.get_id()
+    if not window_id in controlled_windows:
+        print(f"[Control] Window {window_id} is not a controlled window. No update performed.")
+        return  # Not a controlled window, nothing to update
+
+    if not wnd.is_floating():
+        del controlled_windows[window_id]
+        print(f"[Control] Window {window_id} removed from controlled windows (no longer floating).")
+        return
+    if wnd.get_workspace() != controlled_windows[window_id]["window"].get_workspace():
+        # Workspace changed, check monitor
+        print(f"[Control] Window {window_id} workspace changed. Updating monitor information.")
+        old_monitor = controlled_windows[window_id]["window"].get_monitor()
+        new_monitor = wnd.get_monitor()
+        controlled_windows[window_id]["window"] = wnd
+        if old_monitor and new_monitor and old_monitor.get_name() != new_monitor.get_name():
+            print(f"[Control] Window {window_id} monitor was changed.")
+            if controlled_windows[window_id]["data"].get("type") == "sidebar":
+                # Reapply sidebar settings
+                sidebar_data = controlled_windows[window_id]["data"]
+                wnd.make_sidebar(
+                    sidebar_data["align"],
+                    sidebar_data["offset_x"],
+                    sidebar_data["offset_top"],
+                    sidebar_data["offset_bottom"],
+                    sidebar_data["width"]
+                )
+            elif controlled_windows[window_id]["data"].get("type") == "center":
+                # Reapply center settings
+                center_data = controlled_windows[window_id]["data"]
+                wnd.make_center(center_data["width"], center_data["height"])
+        else:
+            print(f"[Control] Window {window_id} monitor has not changed. No action taken.")
+
+
+# Handle a command line input and return the response.
+def handle_command(cmd_line: str) -> str:
+    """Handle a command line input and return the response."""
+    try:
+        parts = shlex.split(cmd_line.strip())
+    except ValueError as e:
+        notify_error("Invalid syntax", f"Failed to parse command line: {e}")
+        return f"ERROR: Invalid syntax ({e})\n"
+
+    if not parts:
+        notify_error("Empty command", "No command provided.")
+        return "ERROR: Empty command\n"
+
+    command, args = parts[0].lower(), parts[1:]
+
+    # Send the focused window to the pocket output
+    if command == "to-pocket":
+        if len(args) != 1:
+            notify_error("Invalid arguments", "'to-pocket' command requires exactly one argument (monitor name).")
+            return "ERROR: 'to-pocket' command requires exactly one argument (monitor name)\n"
+        focused_window = window.get_focused_window()
+        if focused_window:
+            if focused_window.send_to_pocket(args[0]):
+                if focused_window.send_to_pocket(args[0]):
+                    pocket_queue.append(focused_window.get_id())
+                    notify_info("Sent to pocket", f"Window '{focused_window.get_app_id()}' sent to pocket.")
+                    return f"Window {focused_window.get_app_id()} sent to pocket.\n"
+                else:
+                    notify_error("Failed to send to pocket", f"Window '{focused_window.get_app_id()}' could not be sent to pocket.")
+                    return "ERROR: Failed to send window to pocket.\n"
+            else:
+                notify_error("Failed to send to pocket", f"Window '{focused_window.get_app_id()}' could not be sent to pocket.")
+                return "ERROR: Failed to send window to pocket.\n"
+
+    # Retrieve the last window sent to pocket
+    elif command == "from-pocket":
+        if not pocket_queue:
+            notify_error("Pocket is empty", "No window in pocket to retrieve.")
+            return "ERROR: No window in pocket to retrieve.\n"
+        window_id = pocket_queue.pop()
+        window_obj = window.get_window(window_id)
+        if window_obj:
+            if window_obj.get_from_pocket():
+                window_obj.make_focused()
+                return f"Window {window_obj.get_app_id()} retrieved from pocket.\n"
+            else:
+                pocket_queue.append(window_id)  # Put it back if retrieval failed
+                notify_error("Failed to retrieve from pocket", f"Window '{window_obj.get_app_id()}' could not be retrieved from pocket.")
+                return "ERROR: Failed to retrieve window from pocket.\n"
+        else:
+            notify_error("Window not found", "The window could not be found in pocket.")
+            return "ERROR: Window not found in pocket.\n"
+
+    # Make the focused window a sidebar
+    elif command == "sidebar":
+        if len(args) != 5:
+            notify_error("Invalid arguments", "'sidebar' command requires five arguments (align, offset_x, offset_top, offset_bottom, width).")
+            return "ERROR: 'sidebar' command requires five arguments (align, offset_x, offset_top, offset_bottom, width)\n"
+        align = args[0].lower()
+        try:
+            offset_x = int(args[1])
+            offset_top = int(args[2])
+            offset_bottom = int(args[3])
+            width = float(args[4])
+        except ValueError:
+            notify_error("Invalid arguments", "Offsets must be integers and width must be a float.")
+            return "ERROR: Offsets must be integers and width must be a float.\n"
+
+        focused_window = window.get_focused_window()
+        if focused_window:
+            if focused_window.make_sidebar(align, offset_x, offset_top, offset_bottom, width):
+                control_window(focused_window, {
+                    "type": "sidebar",
+                    "align": align,
+                    "offset_x": offset_x,
+                    "offset_top": offset_top,
+                    "offset_bottom": offset_bottom,
+                    "width": width
+                })
+                return f"Window {focused_window.get_app_id()} set as sidebar.\n"
+            else:
+                notify_error("Failed to set sidebar", f"Window '{focused_window.get_app_id()}' could not be set as sidebar.")
+                return "ERROR: Failed to set window as sidebar.\n"
+        else:
+            notify_error("No focused window", "There is no focused window to set as sidebar.")
+            return "ERROR: No focused window to set as sidebar.\n"
+
+    # Make the focused window centered with specified width and height
+    elif command == "center":
+        if len(args) != 2:
+            notify_error("Invalid arguments", "'center' command requires two arguments (width, height).")
+            return "ERROR: 'center' command requires two arguments (width, height)\n"
+        try:
+            width = float(args[0])
+            height = float(args[1])
+        except ValueError:
+            notify_error("Invalid arguments", "Width and height must be numbers.")
+            return "ERROR: Width and height must be numbers.\n"
+
+        focused_window = window.get_focused_window()
+        if focused_window:
+            if focused_window.make_center(width, height):
+                control_window(focused_window, {
+                    "type": "center",
+                    "width": width,
+                    "height": height
+                })
+                return f"Window {focused_window.get_app_id()} centered with size {width}x{height}.\n"
+            else:
+                notify_error("Failed to center window", f"Window '{focused_window.get_app_id()}' could not be centered.")
+                return "ERROR: Failed to center window.\n"
+        else:
+            notify_error("No focused window", "There is no focused window to center.")
+            return "ERROR: No focused window to center.\n"
+
+    else:
+        notify_error("Unknown command", f"Unknown command '{command}'.")
+        return f"ERROR: Unknown command '{command}'\n"
+
+
+def cleanup():
+    """Delete the socket file."""
+    if os.path.exists(SOCKET_PATH):
+        try:
+            os.unlink(SOCKET_PATH)
+        except OSError:
+            pass
+
+
+async def handle_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter
+):
+    """Handle a single client connection."""
+    try:
+        data = await reader.read(4096)
+        if not data:
+            return
+
+        cmd_line = data.decode("utf-8")
+        print(f"[Server] Received: {cmd_line.strip()}")
+
+        response = handle_command(cmd_line)
+
+        writer.write(response.encode("utf-8"))
+        await writer.drain()
+
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def run_daemon():
+    cleanup()
+
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    # Add SIGINT (Ctrl+C) and SIGTERM handlers through the event loop
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, shutdown_event.set)
+
+    # Start the Unix socket server
+    server = await asyncio.start_unix_server(
+        lambda r, w: handle_client(r, w), path=SOCKET_PATH
+    )
+
+    print(f"[Server] Async daemon listening on {SOCKET_PATH}")
+
+    async with server:
+        # Wait for the stop command or termination signal
+        await shutdown_event.wait()
+        print("[Server] Shutting down...")
+
+
+async def run_niri_events_reader():
+    """Start the subprocess and continuously read stdout."""
+    process = await asyncio.create_subprocess_exec(
+        "niri", "msg", "--json", "event-stream",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+
+    try:
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break  # Process has exited
+
+            decoded_line = line.decode("utf-8", errors="replace").rstrip()
+            data = safe_json_loads(decoded_line, default={}) if decoded_line else {}
+            if "WindowOpenedOrChanged" in data and "window" in data["WindowOpenedOrChanged"]:
+                window_data = data["WindowOpenedOrChanged"]["window"]
+                window_obj = window()
+                window_obj.data = window_data
+                window_id = window_data.get("id")
+                print(f"[Subprocess] Window opened/changed: {window_obj.get_app_id()} (ID: {window_id})")
+                update_controlled_window(window_obj)
+
+
+        await process.wait()
+    except asyncio.CancelledError:
+        # Gracefully terminate the child process when the server is shutting down
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                process.kill()
+        raise
+
+async def main():
+    cleanup()
+
+    # 1. Start the Unix socket server
+    server = await asyncio.start_unix_server(handle_client, path=SOCKET_PATH)
+    print(f"[Daemon] Listening on {SOCKET_PATH}")
+
+    # 2. Start the subprocess reader task
+    reader_task = asyncio.create_task(run_niri_events_reader())
+
+    # 3. Hold the server open and wait for shutdown signal
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[Daemon] Received SIGINT (Ctrl+C). Shutting down...")
+    finally:
+        cleanup()
+        print("[Daemon] Socket removed. Stopped.")
