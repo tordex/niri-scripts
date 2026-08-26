@@ -12,9 +12,8 @@ from collections import deque
 from typing import Any
 
 SOCKET_PATH = "/tmp/niri_pocket.sock"
-pocket_queue = deque()  # FIFO queue to store window IDs sent to pocket
-
 controlled_windows = {}  # Dictionary to store controlled windows with their IDs
+pockets = []  # List of pockets
 
 # Load JSON data safely, returning a default value if parsing fails.
 def safe_json_loads(data: Any, default=None) -> Any:
@@ -274,6 +273,31 @@ class window:
             return window_obj
         return None
 
+
+# Define the pocket class to encapsulate its properties and actions.
+class pocket:
+    """Class representing a pocket."""
+
+    def __init__(self, name):
+        self.name = name  # Name of the pocket
+        self.windows = []  # List to store windows in the pocket
+        self.visible = False  # Visibility state of the pocket
+        self.focused_window_id = -1  # ID of the focused window in the pocket
+
+    def get_name(self):
+        """Get the name of the pocket."""
+        return self.name
+
+    def remove_window(self, window_id):
+        """Remove a window from the pocket."""
+        if window_id in self.windows:
+            self.windows.remove(window_id)
+            print(f"[Pocket] Window {window_id} removed from pocket '{self.name}'.")
+            return True
+        print(f"[Pocket] Window {window_id} not found in pocket '{self.name}'.")
+        return False
+
+
 # Add a window to the controlled windows dictionary.
 def control_window(wnd: window, data: dict):
     """Add a window to the controlled windows dictionary."""
@@ -326,6 +350,146 @@ def update_controlled_window(wnd: window):
             print(f"[Control] Window {window_id} monitor has not changed. No action taken.")
 
 
+# Add a focused window to a pocket.
+def command_add_to_pocket(pocket_name: str, monitor_name: str):
+    """Add a window to a pocket."""
+    # Find the pocket by name
+    target_pocket = next((p for p in pockets if p.get_name() == pocket_name), None)
+    if not target_pocket:
+        print(f"[Pocket] Pocket '{pocket_name}' not found. Creating new pocket.")
+        target_pocket = pocket(pocket_name)
+        pockets.append(target_pocket)
+
+    # Get the currently focused window
+    focused_window = window.get_focused_window()
+    if not focused_window:
+        notify_error("No focused window", "There is no focused window to add to pocket.")
+        print("[Pocket] No focused window to add to pocket.")
+        return "ERROR: No focused window to add to pocket.\n"
+
+    # Get the window object
+    window_id = focused_window.get_id()
+    window_obj = focused_window
+    if not window_obj:
+        notify_error("Window not found", f"Window with ID {window_id} not found. Cannot add to pocket.")
+        print(f"[Pocket] Window with ID {window_id} not found. Cannot add to pocket.")
+        return f"ERROR: Window with ID {window_id} not found. Cannot add to pocket.\n"
+
+    # Add the window to the pocket's list
+    target_pocket.windows.append(window_id)
+
+    if not target_pocket.visible:
+        window_obj.send_to_pocket(monitor_name)
+        target_pocket.focused_window_id = window_id
+
+    notify_info("Window added to pocket", f"Window '{window_obj.get_app_id()}' added to pocket '{pocket_name}'.")
+    print(f"[Pocket] Window {window_obj.get_app_id()} added to pocket '{pocket_name}'.")
+    return f"[Pocket] Window {window_obj.get_app_id()} added to pocket '{pocket_name}'."
+
+
+# Toggle the visibility of a pocket.
+def command_toggle_pocket(pocket_name: str, monitor_name: str):
+    """Toggle the visibility of a pocket."""
+    target_pocket = next((p for p in pockets if p.get_name() == pocket_name), None)
+    if not target_pocket:
+        print(f"[Pocket] Pocket '{pocket_name}' not found. Creating new pocket.")
+        target_pocket = pocket(pocket_name)
+        pockets.append(target_pocket)
+
+    target_pocket.visible = not target_pocket.visible
+    state = "visible" if target_pocket.visible else "hidden"
+    print(f"[Pocket] Pocket '{pocket_name}' is now {state}.")
+    focused_window_id = target_pocket.focused_window_id
+    target_pocket.focused_window_id = -1
+    for window_id in target_pocket.windows:
+        window_obj = window.get_window(window_id)
+        if window_obj:
+            if not target_pocket.visible:
+                # Send window to pocket output
+                if window_obj.is_focused() and target_pocket.focused_window_id == -1:
+                    target_pocket.focused_window_id = window_id
+                window_obj.send_to_pocket(monitor_name)
+            else:
+                # Bring window back to the active monitor
+                window_obj.get_from_pocket()
+                if window_id == focused_window_id:
+                    window_obj.make_focused()
+    return f"[Pocket] Pocket '{pocket_name}' toggled to {state}.\n"
+
+
+# Command to set a window as a sidebar with specified alignment and offsets.
+def command_sidebar(align: str, offset_x: int, offset_top: int, offset_bottom: int, width: float) -> str:
+    focused_window = window.get_focused_window()
+    if focused_window:
+        if focused_window.make_sidebar(align, offset_x, offset_top, offset_bottom, width):
+            control_window(focused_window, {
+                "type": "sidebar",
+                "align": align,
+                "offset_x": offset_x,
+                "offset_top": offset_top,
+                "offset_bottom": offset_bottom,
+                "width": width
+            })
+            return f"Window {focused_window.get_app_id()} set as sidebar.\n"
+        else:
+            notify_error("Failed to set sidebar", f"Window '{focused_window.get_app_id()}' could not be set as sidebar.")
+            return "ERROR: Failed to set window as sidebar.\n"
+    else:
+        notify_error("No focused window", "There is no focused window to set as sidebar.")
+        return "ERROR: No focused window to set as sidebar.\n"
+
+
+# Center a window with specified width and height.
+def command_center(width: float, height: float) -> str:
+    focused_window = window.get_focused_window()
+    if focused_window:
+        if focused_window.make_center(width, height):
+            control_window(focused_window, {
+                "type": "center",
+                "width": width,
+                "height": height
+            })
+            return f"Window {focused_window.get_app_id()} centered with size {width}x{height}.\n"
+        else:
+            notify_error("Failed to center window", f"Window '{focused_window.get_app_id()}' could not be centered.")
+            return "ERROR: Failed to center window.\n"
+    else:
+        notify_error("No focused window", "There is no focused window to center.")
+        return "ERROR: No focused window to center.\n"
+
+commands = {
+    "to-pocket": {
+        "handler": command_add_to_pocket,
+        "args": [str, str],
+        "args_description": ["pocket_name", "monitor_name"]
+    },
+    "toggle-pocket": {
+        "handler": command_toggle_pocket,
+        "args": [str, str],
+        "args_description": ["pocket_name", "monitor_name"]
+    },
+    "center": {
+        "handler": command_center,
+        "args": [float, float],
+        "args_description": ["width", "height"]
+    },
+    "sidebar": {
+        "handler": command_sidebar,
+        "args": [str, int, int, int, float],
+        "args_description": ["align", "offset_x", "offset_top", "offset_bottom", "width"]
+    },
+}
+
+
+# Get help text for a specific command.
+def get_command_help(command_name: str) -> str:
+    """Get help text for a specific command."""
+    if command_name not in commands:
+        return f"ERROR: Unknown command '{command_name}'\n"
+
+    cmd = commands[command_name]
+    return " ".join(f"{arg}:{typ.__name__}" for arg, typ in zip(cmd["args_description"], cmd["args"]))
+
 # Handle a command line input and return the response.
 def handle_command(cmd_line: str) -> str:
     """Handle a command line input and return the response."""
@@ -341,111 +505,27 @@ def handle_command(cmd_line: str) -> str:
 
     command, args = parts[0].lower(), parts[1:]
 
-    # Send the focused window to the pocket output
-    if command == "to-pocket":
-        if len(args) != 1:
-            notify_error("Invalid arguments", "'to-pocket' command requires exactly one argument (monitor name).")
-            return "ERROR: 'to-pocket' command requires exactly one argument (monitor name)\n"
-        focused_window = window.get_focused_window()
-        if focused_window:
-            if focused_window.send_to_pocket(args[0]):
-                if focused_window.send_to_pocket(args[0]):
-                    pocket_queue.append(focused_window.get_id())
-                    notify_info("Sent to pocket", f"Window '{focused_window.get_app_id()}' sent to pocket.")
-                    return f"Window {focused_window.get_app_id()} sent to pocket.\n"
-                else:
-                    notify_error("Failed to send to pocket", f"Window '{focused_window.get_app_id()}' could not be sent to pocket.")
-                    return "ERROR: Failed to send window to pocket.\n"
-            else:
-                notify_error("Failed to send to pocket", f"Window '{focused_window.get_app_id()}' could not be sent to pocket.")
-                return "ERROR: Failed to send window to pocket.\n"
-
-    # Retrieve the last window sent to pocket
-    elif command == "from-pocket":
-        if not pocket_queue:
-            notify_error("Pocket is empty", "No window in pocket to retrieve.")
-            return "ERROR: No window in pocket to retrieve.\n"
-        window_id = pocket_queue.pop()
-        window_obj = window.get_window(window_id)
-        if window_obj:
-            if window_obj.get_from_pocket():
-                window_obj.make_focused()
-                return f"Window {window_obj.get_app_id()} retrieved from pocket.\n"
-            else:
-                pocket_queue.append(window_id)  # Put it back if retrieval failed
-                notify_error("Failed to retrieve from pocket", f"Window '{window_obj.get_app_id()}' could not be retrieved from pocket.")
-                return "ERROR: Failed to retrieve window from pocket.\n"
-        else:
-            notify_error("Window not found", "The window could not be found in pocket.")
-            return "ERROR: Window not found in pocket.\n"
-
-    # Make the focused window a sidebar
-    elif command == "sidebar":
-        if len(args) != 5:
-            notify_error("Invalid arguments", "'sidebar' command requires five arguments (align, offset_x, offset_top, offset_bottom, width).")
-            return "ERROR: 'sidebar' command requires five arguments (align, offset_x, offset_top, offset_bottom, width)\n"
-        align = args[0].lower()
-        try:
-            offset_x = int(args[1])
-            offset_top = int(args[2])
-            offset_bottom = int(args[3])
-            width = float(args[4])
-        except ValueError:
-            notify_error("Invalid arguments", "Offsets must be integers and width must be a float.")
-            return "ERROR: Offsets must be integers and width must be a float.\n"
-
-        focused_window = window.get_focused_window()
-        if focused_window:
-            if focused_window.make_sidebar(align, offset_x, offset_top, offset_bottom, width):
-                control_window(focused_window, {
-                    "type": "sidebar",
-                    "align": align,
-                    "offset_x": offset_x,
-                    "offset_top": offset_top,
-                    "offset_bottom": offset_bottom,
-                    "width": width
-                })
-                return f"Window {focused_window.get_app_id()} set as sidebar.\n"
-            else:
-                notify_error("Failed to set sidebar", f"Window '{focused_window.get_app_id()}' could not be set as sidebar.")
-                return "ERROR: Failed to set window as sidebar.\n"
-        else:
-            notify_error("No focused window", "There is no focused window to set as sidebar.")
-            return "ERROR: No focused window to set as sidebar.\n"
-
-    # Make the focused window centered with specified width and height
-    elif command == "center":
-        if len(args) != 2:
-            notify_error("Invalid arguments", "'center' command requires two arguments (width, height).")
-            return "ERROR: 'center' command requires two arguments (width, height)\n"
-        try:
-            width = float(args[0])
-            height = float(args[1])
-        except ValueError:
-            notify_error("Invalid arguments", "Width and height must be numbers.")
-            return "ERROR: Width and height must be numbers.\n"
-
-        focused_window = window.get_focused_window()
-        if focused_window:
-            if focused_window.make_center(width, height):
-                control_window(focused_window, {
-                    "type": "center",
-                    "width": width,
-                    "height": height
-                })
-                return f"Window {focused_window.get_app_id()} centered with size {width}x{height}.\n"
-            else:
-                notify_error("Failed to center window", f"Window '{focused_window.get_app_id()}' could not be centered.")
-                return "ERROR: Failed to center window.\n"
-        else:
-            notify_error("No focused window", "There is no focused window to center.")
-            return "ERROR: No focused window to center.\n"
-
-    else:
+    if command not in commands:
         notify_error("Unknown command", f"Unknown command '{command}'.")
         return f"ERROR: Unknown command '{command}'\n"
 
+    cmd = commands[command]
 
+    if len(args) != len(cmd["args"]):
+        notify_error("Invalid arguments", f"Command '{command}' expects {len(cmd['args'])} arguments: {get_command_help(command).strip()}")
+        return f"ERROR: Command '{command}' expects {len(cmd['args'])} arguments: {get_command_help(command).strip()}\n"
+
+    # Convert arguments to the expected types
+    try:
+        args = [typ(arg) for typ, arg in zip(cmd["args"], args)]
+    except ValueError:
+        notify_error("Invalid arguments", f"Failed to convert arguments. Expected arguments: {get_command_help(command).strip()}")
+        return f"ERROR: Failed to convert arguments. Expected arguments: {get_command_help(command).strip()}\n"
+
+    return cmd["handler"](*args)
+
+
+# Cleanup function to remove the socket file on exit.
 def cleanup():
     """Delete the socket file."""
     if os.path.exists(SOCKET_PATH):
@@ -454,7 +534,7 @@ def cleanup():
         except OSError:
             pass
 
-
+# Async function to handle a single client connection.
 async def handle_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter
@@ -478,6 +558,7 @@ async def handle_client(
         await writer.wait_closed()
 
 
+# Main async function to run the daemon
 async def run_daemon():
     cleanup()
 
@@ -501,6 +582,7 @@ async def run_daemon():
         print("[Server] Shutting down...")
 
 
+# Subprocess to read niri events
 async def run_niri_events_reader():
     """Start the subprocess and continuously read stdout."""
     process = await asyncio.create_subprocess_exec(
@@ -524,7 +606,14 @@ async def run_niri_events_reader():
                 window_id = window_data.get("id")
                 print(f"[Subprocess] Window opened/changed: {window_obj.get_app_id()} (ID: {window_id})")
                 update_controlled_window(window_obj)
-
+            elif "WindowClosed" in data and "id" in data["WindowClosed"]:
+                window_id = data["WindowClosed"]["id"]
+                print(f"[Subprocess] Window closed: ID {window_id}")
+                for pocket in pockets:
+                    pocket.remove_window(window_id)
+                if window_id in controlled_windows:
+                    del controlled_windows[window_id]
+                    print(f"[Control] Window {window_id} removed from controlled windows (closed).")
 
         await process.wait()
     except asyncio.CancelledError:
@@ -537,6 +626,7 @@ async def run_niri_events_reader():
                 process.kill()
         raise
 
+# Main entry point for the daemon
 async def main():
     cleanup()
 
