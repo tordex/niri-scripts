@@ -61,3 +61,7 @@ Note that you must use the `nc` command to send commands to the `niri-pocket` da
 5. Press `Mod+F5` again to hide all the windows in the pocket.
 
 Note that `niri-pocket` saves the focused window when hiding a pocket. When you show the pocket, the same window will be focused. However, if a window outside the pocket was focused when the pocket was hidden, the focused window will not change when the pocket is shown.
+
+# License
+
+Licensed under the [MIT License](LICENSE).
