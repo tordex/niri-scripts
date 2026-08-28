@@ -394,15 +394,15 @@ def command_toggle_pocket(pocket_name: str, monitor_name: str):
         target_pocket = pocket(pocket_name)
         pockets.append(target_pocket)
 
-    target_pocket.visible = not target_pocket.visible
     state = "visible" if target_pocket.visible else "hidden"
     print(f"[Pocket] Pocket '{pocket_name}' is now {state}.")
     focused_window_id = target_pocket.focused_window_id
     target_pocket.focused_window_id = -1
+    change_pocket_status  = False
     for window_id in target_pocket.windows:
         window_obj = window.get_window(window_id)
         if window_obj:
-            if not target_pocket.visible:
+            if target_pocket.visible:
                 # Send window to pocket output
                 if window_obj.is_focused() and target_pocket.focused_window_id == -1:
                     target_pocket.focused_window_id = window_id
@@ -412,7 +412,13 @@ def command_toggle_pocket(pocket_name: str, monitor_name: str):
                 window_obj.get_from_pocket()
                 if window_id == focused_window_id:
                     window_obj.make_focused()
-    return f"[Pocket] Pocket '{pocket_name}' toggled to {state}.\n"
+            change_pocket_status = True
+    if change_pocket_status:
+        target_pocket.visible = not target_pocket.visible
+        state = "visible" if target_pocket.visible else "hidden"
+        return f"[Pocket] Pocket '{pocket_name}' toggled to {state}.\n"
+    notify_info("Pocket empty", f"Pocket '{pocket_name}' is empty, status unchanged.")
+    return f"[Pocket] Pocket '{pocket_name}' is empty, status unchanged.\n"
 
 
 # Command to set a window as a sidebar with specified alignment and offsets.
