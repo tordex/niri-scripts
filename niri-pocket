@@ -373,6 +373,12 @@ def command_add_to_pocket(pocket_name: str, monitor_name: str):
         print(f"[Pocket] Window with ID {window_id} not found. Cannot add to pocket.")
         return f"ERROR: Window with ID {window_id} not found. Cannot add to pocket.\n"
 
+    if window_id in target_pocket.windows:
+        notify_info("Window removed from pocket", f"Window '{window_obj.get_app_id()}' removed from pocket '{pocket_name}'.")
+        print(f"[Pocket] Window {window_id} is already in pocket '{pocket_name}'.")
+        target_pocket.windows.remove(window_id)
+        return f"[Pocket] Window {window_id} removed from pocket '{pocket_name}'.\n"
+
     # Add the window to the pocket's list
     target_pocket.windows.append(window_id)
 
